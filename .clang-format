@@ -1,0 +1,9 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: AcrossEmptyLines
+BreakBeforeBraces: Linux
+AlwaysBreakAfterReturnType: AllDefinitions
+ColumnLimit: 100
+...
