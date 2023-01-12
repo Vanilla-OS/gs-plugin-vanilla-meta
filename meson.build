@@ -6,7 +6,8 @@ files = [
 
 deps = [
   dependency('glib-2.0', version : '>= 2.70.0'),
-  dependency('gnome-software')
+  dependency('gnome-software'),
+  dependency('xmlb', version: '>= 0.1.7', fallback: ['libxmlb', 'libxmlb_dep'])
 ]
 
 args = [
