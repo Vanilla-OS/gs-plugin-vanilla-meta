@@ -11,7 +11,8 @@ deps = [
 
 args = [
   '-fPIC',
-  '-DI_KNOW_THE_GNOME_SOFTWARE_API_IS_SUBJECT_TO_CHANGE'
+  '-DI_KNOW_THE_GNOME_SOFTWARE_API_IS_SUBJECT_TO_CHANGE',
+  '-DG_LOG_DOMAIN="GsPluginVanillaMeta"'
 ]
 
 shared_module(
