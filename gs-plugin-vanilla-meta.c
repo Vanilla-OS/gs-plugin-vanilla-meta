@@ -108,22 +108,27 @@ download_file_cb(GObject *source_object, GAsyncResult *result, gpointer user_dat
         stream_data         = g_converter_input_stream_new(G_INPUT_STREAM(gz_file_inputstream),
                                                            G_CONVERTER(decompressor));
 
-        g_debug("Creating new metadata file");
+        // Delete old xml file if it exists
+        if (g_file_query_exists(xml_file, cancellable)) {
+            g_debug("Deleting old metadata file");
+            g_file_delete(xml_file, cancellable, &error);
+        }
+
         // Create new file to store uncompressed data
+        g_debug("Creating new metadata file");
         xml_file = g_file_new_for_path(metadata_filename);
         xml_file_iostream =
             g_file_create_readwrite(xml_file, G_FILE_CREATE_NONE, cancellable, &error);
         xml_outputstream = g_io_stream_get_output_stream(G_IO_STREAM(xml_file_iostream));
 
         // Read from gz and write to xml
-        gssize read_count  = 1;
-        guint8 buffer[100] = {};
+        gssize read_count   = 1;
+        guint8 buffer[1024] = {0};
 
         g_debug("Writing metadata");
         while (read_count) {
-            read_count = g_input_stream_read(G_INPUT_STREAM(gz_file_inputstream), buffer, 100,
-                                             cancellable, &error);
-            g_output_stream_write(xml_outputstream, buffer, 100, cancellable, &error);
+            read_count = g_input_stream_read(stream_data, buffer, 1024, cancellable, &error);
+            g_output_stream_write(xml_outputstream, buffer, 1024, cancellable, &error);
         }
 
         // Delete gz file
