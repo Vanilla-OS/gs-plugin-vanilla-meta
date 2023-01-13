@@ -1,7 +1,8 @@
 project('gs_plugin_vanilla_meta', 'c')
 
 files = [
-  'gs-plugin-vanilla-meta.c'
+  'gs-plugin-vanilla-meta.c',
+  'gs-vanilla-meta-util.c'
 ]
 
 deps = [

@@ -4,9 +4,15 @@
 
 #include <glib.h>
 #include <gnome-software.h>
+#include <gnome-software/gs-appstream.h>
 #include <xmlb.h>
 
+#include "gs-app-list.h"
+#include "gs-app.h"
 #include "gs-plugin-vanilla-meta.h"
+#include "gs-vanilla-meta-util.h"
+
+static void claim_app_list(GsPluginVanillaMeta *self, GsAppList *list);
 
 static void refresh_metadata_thread_cb(GTask *task,
                                        gpointer source_object,
@@ -16,6 +22,10 @@ static gboolean add_apps_from_metadata_file(GsPluginVanillaMeta *self,
                                             GFile *metadata_file,
                                             GCancellable *cancellable,
                                             GError **error);
+static void list_apps_thread_cb(GTask *task,
+                                gpointer source_object,
+                                gpointer task_data,
+                                GCancellable *cancellable);
 
 const gchar *gz_metadata_filename   = ".cache/vanilla_meta/metadata.xml.gz";
 const gchar *metadata_silo_filename = ".cache/vanilla_meta/metadata.xmlb";
@@ -24,6 +34,7 @@ const gchar *metadata_url           = "";
 struct _GsPluginVanillaMeta {
     GsPlugin parent;
     GsWorkerThread *worker; /* (owned) */
+    // TODO: Create mutex lock for silo
     XbSilo *silo;
 };
 
@@ -76,6 +87,21 @@ gs_plugin_adopt_app(GsPlugin *plugin, GsApp *app)
     if (gs_app_get_metadata_item(app, "Vanilla::apx_container") != NULL) {
         g_debug("I should adopt app %s", gs_app_get_name(app));
         gs_app_set_management_plugin(app, plugin);
+        gs_vanilla_meta_app_set_packaging_info(app);
+    }
+}
+
+static void
+claim_app_list(GsPluginVanillaMeta *self, GsAppList *list)
+{
+    for (guint i = 0; i < gs_app_list_length(list); i++) {
+        GsApp *app = gs_app_list_index(list, i);
+
+        if (gs_app_has_quirk(app, GS_APP_QUIRK_IS_WILDCARD))
+            continue;
+
+        gs_app_set_management_plugin(app, GS_PLUGIN(self));
+        gs_vanilla_meta_app_set_packaging_info(app);
     }
 }
 
@@ -206,28 +232,71 @@ gs_plugin_vanilla_meta_refresh_metadata_finish(GsPlugin *plugin,
     return g_task_propagate_boolean(G_TASK(result), error);
 }
 
-/* static void */
-/* gs_plugin_vanilla_meta_list_apps_async(GsPlugin *plugin, */
-/*                                        GsAppQuery *query, */
-/*                                        GsPluginListAppsFlags flags, */
-/*                                        GCancellable *cancellable, */
-/*                                        GAsyncReadyCallback callback, */
-/*                                        gpointer user_data) */
-/* { */
-/*     g_autoptr(GTask) task = NULL; */
-/**/
-/*     task = */
-/*         gs_plugin_list_apps_data_new_task(plugin, query, flags, cancellable, callback,
- * user_data); */
-/**/
-/*     g_task_set_source_tag(task, gs_plugin_vanilla_meta_list_apps_async); */
-/* } */
-/**/
-/* static GsAppList * */
-/* gs_plugin_list_apps_finish(GsPlugin *plugin, GAsyncResult *result, GError **error) */
-/* { */
-/*     return g_task_propagate_pointer(G_TASK(result), error); */
-/* } */
+static void
+gs_plugin_vanilla_meta_list_apps_async(GsPlugin *plugin,
+                                       GsAppQuery *query,
+                                       GsPluginListAppsFlags flags,
+                                       GCancellable *cancellable,
+                                       GAsyncReadyCallback callback,
+                                       gpointer user_data)
+{
+    GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(plugin);
+    g_autoptr(GTask) task     = NULL;
+
+    task =
+        gs_plugin_list_apps_data_new_task(plugin, query, flags, cancellable, callback, user_data);
+    g_task_set_source_tag(task, gs_plugin_vanilla_meta_list_apps_async);
+
+    gs_worker_thread_queue(self->worker, G_PRIORITY_LOW, list_apps_thread_cb,
+                           g_steal_pointer(&task));
+}
+
+static void
+list_apps_thread_cb(GTask *task,
+                    gpointer source_object,
+                    gpointer task_data,
+                    GCancellable *cancellable)
+{
+    GsPluginVanillaMeta *self  = GS_PLUGIN_VANILLA_META(source_object);
+    GsPluginListAppsData *data = task_data;
+
+    const gchar *const *keywords = NULL;
+
+    /* g_autoptr(GsAppList) list     = gs_app_list_new(); */
+    g_autoptr(GsAppList) list_tmp = gs_app_list_new();
+    g_autoptr(GError) error       = NULL;
+
+    if (data->query != NULL) {
+        keywords = gs_app_query_get_keywords(data->query);
+    }
+
+    if (keywords != NULL) {
+        if (!gs_appstream_search(GS_PLUGIN(self), self->silo, keywords, list_tmp, cancellable,
+                                 &error)) {
+            g_debug("Error while searching: %s", error->message);
+            g_task_return_error(task, g_steal_pointer(&error));
+            return;
+        }
+    }
+
+    claim_app_list(self, list_tmp);
+
+    // TODO: Remove this once we can install packages
+    for (guint i = 0; i < gs_app_list_length(list_tmp); i++) {
+        gs_app_set_state(gs_app_list_index(list_tmp, i), GS_APP_STATE_AVAILABLE);
+    }
+
+    /* gs_app_list_add_list(list, tmp_list); */
+
+    g_task_return_pointer(task, g_steal_pointer(&list_tmp), g_object_unref);
+    /* g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref); */
+}
+
+static GsAppList *
+gs_plugin_list_apps_finish(GsPlugin *plugin, GAsyncResult *result, GError **error)
+{
+    return g_task_propagate_pointer(G_TASK(result), error);
+}
 
 static void
 gs_plugin_vanilla_meta_class_init(GsPluginVanillaMetaClass *klass)
@@ -241,8 +310,8 @@ gs_plugin_vanilla_meta_class_init(GsPluginVanillaMetaClass *klass)
     plugin_class->setup_finish            = gs_plugin_vanilla_meta_setup_finish;
     plugin_class->refresh_metadata_async  = gs_plugin_vanilla_meta_refresh_metadata_async;
     plugin_class->refresh_metadata_finish = gs_plugin_vanilla_meta_refresh_metadata_finish;
-    /* plugin_class->list_apps_async         = gs_plugin_vanilla_meta_list_apps_async; */
-    /* plugin_class->list_apps_finish        = gs_plugin_list_apps_finish; */
+    plugin_class->list_apps_async         = gs_plugin_vanilla_meta_list_apps_async;
+    plugin_class->list_apps_finish        = gs_plugin_list_apps_finish;
 }
 
 GType
