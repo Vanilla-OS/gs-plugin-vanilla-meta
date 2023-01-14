@@ -7,13 +7,10 @@
 #include <gnome-software/gs-appstream.h>
 #include <xmlb.h>
 
-#include "gs-app-list.h"
-#include "gs-app.h"
 #include "gs-plugin-vanilla-meta.h"
 #include "gs-vanilla-meta-util.h"
 
 static void claim_app_list(GsPluginVanillaMeta *self, GsAppList *list);
-
 static void refresh_metadata_thread_cb(GTask *task,
                                        gpointer source_object,
                                        gpointer task_data,
@@ -26,6 +23,10 @@ static void list_apps_thread_cb(GTask *task,
                                 gpointer source_object,
                                 gpointer task_data,
                                 GCancellable *cancellable);
+static void refine_thread_cb(GTask *task,
+                             gpointer source_object,
+                             gpointer task_data,
+                             GCancellable *cancellable);
 
 const gchar *gz_metadata_filename   = ".cache/vanilla_meta/metadata.xml.gz";
 const gchar *metadata_silo_filename = ".cache/vanilla_meta/metadata.xmlb";
@@ -78,7 +79,48 @@ gs_plugin_vanilla_meta_init(GsPluginVanillaMeta *self)
 {
     GsPlugin *plugin = GS_PLUGIN(self);
 
+    gs_plugin_set_appstream_id(plugin, "org.vanillaos.meta");
+
     gs_plugin_add_rule(plugin, GS_PLUGIN_RULE_RUN_AFTER, "appstream");
+}
+
+gboolean
+gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellable, GError **error)
+{
+    g_autoptr(GsApp) app = NULL;
+
+    // Create source
+    app = gs_app_new("org.vanillaos.vanilla-meta");
+    gs_app_set_kind(app, AS_COMPONENT_KIND_REPOSITORY);
+    gs_app_set_state(app, GS_APP_STATE_INSTALLED);
+    gs_app_add_quirk(app, GS_APP_QUIRK_NOT_LAUNCHABLE);
+    gs_app_set_size_download(app, GS_SIZE_TYPE_UNKNOWABLE, 0);
+    gs_app_set_management_plugin(app, plugin);
+    gs_vanilla_meta_app_set_packaging_info(app);
+    gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
+
+    gs_app_set_metadata(app, "GnomeSoftware::SortKey", "200");
+    gs_app_set_metadata(app, "GnomeSoftware::InstallationKind", "System Installation");
+    gs_app_add_quirk(app, GS_APP_QUIRK_PROVENANCE);
+
+    gs_app_set_name(app, GS_APP_QUALITY_NORMAL, "VanillaOS Meta");
+    gs_app_set_summary(app, GS_APP_QUALITY_LOWEST,
+                       "Applications installable via Apx with pre-defined container configuration");
+
+    /* origin_ui on a remote is the repo dialogue section name,
+     * not the remote title */
+    gs_app_set_origin_ui(app, "Apx Apps");
+    gs_app_set_description(app, GS_APP_QUALITY_NORMAL,
+                           "This repository contains a set of popular applications installable via "
+                           "Apx and pre-configured by the Vanilla OS team to guarantee that they "
+                           "are using the most compatible container and configurations.");
+    gs_app_set_url(app, AS_URL_KIND_HOMEPAGE, "https://vanillaos.org");
+
+    gs_app_list_add(list, app);
+
+    // TODO: Add related apps (the ones installed from our repo)
+
+    return true;
 }
 
 void
@@ -97,8 +139,18 @@ claim_app_list(GsPluginVanillaMeta *self, GsAppList *list)
     for (guint i = 0; i < gs_app_list_length(list); i++) {
         GsApp *app = gs_app_list_index(list, i);
 
-        if (gs_app_has_quirk(app, GS_APP_QUIRK_IS_WILDCARD))
+        g_debug("%s belongs to us", gs_app_get_id(app));
+
+        if (gs_app_has_quirk(app, GS_APP_QUIRK_IS_WILDCARD)) {
+            g_debug("App %s is wildcard. Skipping..", gs_app_get_id(app));
             continue;
+        }
+
+        gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
+        gs_app_set_branch(app, "main");
+        gs_app_set_origin(app, "vanilla-meta");
+        gs_app_set_origin_appstream(app, "vanilla-meta");
+        gs_app_set_origin_ui(app, "VanillaOS Meta");
 
         gs_app_set_management_plugin(app, GS_PLUGIN(self));
         gs_vanilla_meta_app_set_packaging_info(app);
@@ -270,6 +322,7 @@ list_apps_thread_cb(GTask *task,
         keywords = gs_app_query_get_keywords(data->query);
     }
 
+    // TODO: Move this and other appstream-related queries to a separate function
     if (keywords != NULL) {
         if (!gs_appstream_search(GS_PLUGIN(self), self->silo, keywords, list_tmp, cancellable,
                                  &error)) {
@@ -283,8 +336,18 @@ list_apps_thread_cb(GTask *task,
 
     // TODO: Remove this once we can install packages
     for (guint i = 0; i < gs_app_list_length(list_tmp); i++) {
+        g_debug("%s", gs_app_to_string(gs_app_list_index(list_tmp, i)));
         gs_app_set_state(gs_app_list_index(list_tmp, i), GS_APP_STATE_AVAILABLE);
     }
+
+    /* for (guint i = 0; i < gs_app_list_length(list_tmp); i++) { */
+    /*     g_autoptr(GsApp) app = gs_app_list_index(list_tmp, i); */
+    /*     gchar *id = gs_utils_build_unique_id(AS_COMPONENT_SCOPE_USER, AS_BUNDLE_KIND_PACKAGE, */
+    /*                                          gs_app_get_origin(app), gs_app_get_id(app), */
+    /*                                          gs_app_get_branch(app)); */
+    /*     g_debug("App unique id: %s", id); */
+    /*     gs_plugin_cache_add(GS_PLUGIN(self), id, app); */
+    /* } */
 
     /* gs_app_list_add_list(list, tmp_list); */
 
@@ -296,6 +359,71 @@ static GsAppList *
 gs_plugin_list_apps_finish(GsPlugin *plugin, GAsyncResult *result, GError **error)
 {
     return g_task_propagate_pointer(G_TASK(result), error);
+}
+
+static void
+gs_plugin_vanilla_meta_refine_async(GsPlugin *plugin,
+                                    GsAppList *list,
+                                    GsPluginRefineFlags flags,
+                                    GCancellable *cancellable,
+                                    GAsyncReadyCallback callback,
+                                    gpointer user_data)
+{
+    GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(plugin);
+    g_autoptr(GTask) task     = NULL;
+
+    task = gs_plugin_refine_data_new_task(plugin, list, flags, cancellable, callback, user_data);
+
+    g_task_set_source_tag(task, gs_plugin_vanilla_meta_refine_async);
+
+    gs_worker_thread_queue(self->worker, G_PRIORITY_LOW, refine_thread_cb, g_steal_pointer(&task));
+}
+
+static void
+refine_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+    GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(source_object);
+    GsPluginRefineData *data  = task_data;
+
+    for (guint i = 0; i < gs_app_list_length(data->list); i++) {
+        GsApp *app = gs_app_list_index(data->list, i);
+
+        // If the app isn't ours, do nothing
+        if (!gs_app_has_management_plugin(app, GS_PLUGIN(self)))
+            continue;
+
+        /* const gchar *origin           = gs_app_get_origin(app); */
+        const gchar *source           = gs_app_get_source_default(app);
+        g_autofree gchar *source_safe = NULL;
+        g_autofree gchar *xpath       = NULL;
+        g_autoptr(XbNode) component   = NULL;
+        g_autoptr(GError) error_local = NULL;
+
+        /* find using source and origin */
+        source_safe = xb_string_escape(source);
+        xpath       = g_strdup_printf("components/component/"
+                                            "bundle[@container]/..");
+        component   = xb_silo_query_first(self->silo, xpath, &error_local);
+
+        if (component == NULL) {
+            g_debug("no match for %s: %s", xpath, error_local->message);
+            g_clear_error(&error_local);
+        }
+
+        gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, data->flags,
+                                &error_local);
+
+        g_debug("Refined %s", gs_app_get_id(app));
+        g_debug("%s", gs_app_to_string(app));
+    }
+
+    g_task_return_boolean(task, true);
+}
+
+static gboolean
+gs_plugin_vanilla_meta_refine_finish(GsPlugin *plugin, GAsyncResult *result, GError **error)
+{
+    return g_task_propagate_boolean(G_TASK(result), error);
 }
 
 static void
@@ -312,6 +440,8 @@ gs_plugin_vanilla_meta_class_init(GsPluginVanillaMetaClass *klass)
     plugin_class->refresh_metadata_finish = gs_plugin_vanilla_meta_refresh_metadata_finish;
     plugin_class->list_apps_async         = gs_plugin_vanilla_meta_list_apps_async;
     plugin_class->list_apps_finish        = gs_plugin_list_apps_finish;
+    plugin_class->refine_async            = gs_plugin_vanilla_meta_refine_async;
+    plugin_class->refine_finish           = gs_plugin_vanilla_meta_refine_finish;
 }
 
 GType
