@@ -258,7 +258,99 @@ gs_plugin_launch(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GError
 gboolean
 gs_plugin_app_install(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GError **error)
 {
-    return FALSE;
+    const gchar *package_name       = NULL;
+    const gchar *container_flag     = NULL;
+    const gchar *app_container_name = gs_app_get_metadata_item(app, "Vanilla::container");
+
+    // Only process this app if was created by this plugin
+    if (!gs_app_has_management_plugin(app, plugin))
+        return TRUE;
+
+    // Check container exists, otherwise run init for it
+    GInputStream *input_stream;
+
+    input_stream = gs_vanilla_meta_run_subprocess(
+        "podman container ls --noheading -a | rev | cut -d\' \' -f 1 | rev",
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE, cancellable, error);
+
+    if (input_stream != NULL) {
+        g_autoptr(GByteArray) output = g_byte_array_new();
+        gchar buffer[4096];
+        gsize nread = 0;
+        gboolean success;
+        g_auto(GStrv) splits = NULL;
+
+        gs_app_set_state(app, GS_APP_STATE_INSTALLING);
+
+        while (success = g_input_stream_read_all(input_stream, buffer, sizeof(buffer), &nread,
+                                                 cancellable, error),
+               success && nread > 0) {
+            g_byte_array_append(output, (const guint8 *)buffer, nread);
+        }
+
+        // If we have a valid output
+        if (success && output->len > 0) {
+            // NUL-terminate the array, to use it as a string
+            g_byte_array_append(output, (const guint8 *)"", 1);
+
+            splits = g_strsplit((gchar *)output->data, "\n", -1);
+
+            if (app_container_name == NULL) {
+                g_debug("Install: Container name not set for %s, cannot install",
+                        gs_app_get_name(app));
+                gs_app_set_state(app, GS_APP_STATE_AVAILABLE);
+                return FALSE;
+            }
+
+            gboolean container_installed = FALSE;
+            for (guint i = 0; i < g_strv_length(splits); i++) {
+                if (g_strcmp0(splits[i], app_container_name) == 0) {
+                    // Container is installed, nothing to do for now
+                    g_debug("Container %s already initialized", app_container_name);
+                    container_installed = TRUE;
+                    break;
+                }
+            }
+
+            // Initialize container
+            if (!container_installed) {
+                g_debug("Install: Running init for container %s", app_container_name);
+
+                container_flag = apx_container_flag_from_name(app_container_name);
+
+                const gchar *init_cmd = g_strdup_printf("apx %s init", container_flag);
+                gs_vanilla_meta_run_subprocess(init_cmd, G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
+                                               cancellable, error);
+            }
+        }
+    }
+
+    // Install package and process output
+    if (container_flag == NULL)
+        container_flag = apx_container_flag_from_name(app_container_name);
+
+    package_name = gs_app_get_source_default(app);
+    if (package_name == NULL) {
+        g_debug("Install: Package name for %s is null, can't install", gs_app_get_name(app));
+        gs_app_set_state(app, GS_APP_STATE_AVAILABLE);
+        return FALSE;
+    }
+
+    g_debug("Installing app %s, using container flag `%s` and package name `%s`",
+            gs_app_get_name(app), container_flag, package_name);
+
+    g_clear_object(&input_stream);
+    const gchar *install_cmd = g_strdup_printf("apx %s install %s", container_flag, package_name);
+
+    input_stream = gs_vanilla_meta_run_subprocess(install_cmd, G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
+                                                  cancellable, error);
+    if (input_stream != NULL) {
+        gs_app_set_state(app, GS_APP_STATE_INSTALLED);
+        return TRUE;
+    } else {
+        gs_app_set_state(app, GS_APP_STATE_AVAILABLE);
+        return FALSE;
+    }
 }
 
 gboolean
@@ -647,6 +739,9 @@ refine_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCance
         g_autofree gchar *xpath       = NULL;
         g_autoptr(XbNode) component   = NULL;
         g_autoptr(GError) error_local = NULL;
+        const gchar *container_name   = NULL;
+        XbNodeChildIter iter;
+        g_autoptr(XbNode) child = NULL;
 
         /* find using source and origin */
         source_safe = xb_string_escape(source);
@@ -665,6 +760,17 @@ refine_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCance
 
         gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, data->flags,
                                 &error_local);
+
+        // Iterate node's children until we find container name
+        xb_node_child_iter_init(&iter, component);
+        while (xb_node_child_iter_next(&iter, &child)) {
+            container_name = xb_node_get_attr(child, "container");
+            if (container_name != NULL)
+                break;
+        }
+
+        gs_app_set_metadata(app, "Vanilla::container", container_name);
+        g_debug("Adding container %s to app %s", container_name, gs_app_get_name(app));
 
         /* gs_app_set_origin(app, "vanilla_meta"); */
         /* gs_app_set_origin_appstream(app, "vanilla_meta"); */
