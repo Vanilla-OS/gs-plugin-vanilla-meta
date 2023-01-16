@@ -29,6 +29,7 @@ static void enable_repository_thread_cb(GTask *task,
                                         gpointer task_data,
                                         GCancellable *cancellable);
 static void claim_app_list(GsPluginVanillaMeta *self, GsAppList *list);
+gboolean is_app_installed(GsApp *app, GCancellable *cancellable, GError **error);
 static void refresh_metadata_thread_cb(GTask *task,
                                        gpointer source_object,
                                        gpointer task_data,
@@ -371,7 +372,34 @@ gs_plugin_app_upgrade_trigger(GsPlugin *plugin,
 gboolean
 gs_plugin_app_remove(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GError **error)
 {
-    return FALSE;
+    const gchar *package_name       = NULL;
+    const gchar *container_flag     = NULL;
+    const gchar *app_container_name = gs_app_get_metadata_item(app, "Vanilla::container");
+    GInputStream *input_stream;
+
+    // Only process this app if was created by this plugin
+    if (!gs_app_has_management_plugin(app, plugin))
+        return TRUE;
+
+    container_flag = apx_container_flag_from_name(app_container_name);
+    package_name   = gs_app_get_source_default(app);
+    if (package_name == NULL) {
+        g_debug("Remove: Package name for %s is null, can't remove", gs_app_get_name(app));
+        gs_app_set_state(app, GS_APP_STATE_UNKNOWN); // We have no idea if remove actually ran
+        return FALSE;
+    }
+
+    const gchar *remove_cmd = g_strdup_printf("apx %s remove -y %s", container_flag, package_name);
+
+    input_stream = gs_vanilla_meta_run_subprocess(remove_cmd, G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
+                                                  cancellable, error);
+    if (input_stream != NULL) {
+        gs_app_set_state(app, GS_APP_STATE_AVAILABLE);
+        return TRUE;
+    } else {
+        gs_app_set_state(app, GS_APP_STATE_UNKNOWN);
+        return FALSE;
+    }
 }
 
 gboolean
@@ -635,6 +663,12 @@ gs_plugin_vanilla_meta_list_apps_async(GsPlugin *plugin,
                            g_steal_pointer(&task));
 }
 
+gboolean
+is_app_installed(GsApp *app, GCancellable *cancellable, GError **error)
+{
+    // Query apx for whether app is installed, depends on implementation inside apx
+}
+
 static void
 list_apps_thread_cb(GTask *task,
                     gpointer source_object,
@@ -677,7 +711,6 @@ list_apps_thread_cb(GTask *task,
 
     // TODO: Remove this once we can install packages
     for (guint i = 0; i < gs_app_list_length(list_tmp); i++) {
-        g_debug("%s", gs_app_to_string(gs_app_list_index(list_tmp, i)));
         gs_app_set_state(gs_app_list_index(list_tmp, i), GS_APP_STATE_AVAILABLE);
     }
 
