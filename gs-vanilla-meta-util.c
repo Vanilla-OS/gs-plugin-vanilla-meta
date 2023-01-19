@@ -41,12 +41,15 @@ apx_container_flag_from_name(const gchar *container)
 /*
  * Runs subprocess and returns an input stream to stdout, or NULL on error.
  */
-GInputStream *
+SubprocessOutput *
 gs_vanilla_meta_run_subprocess(const gchar *cmd,
                                GSubprocessFlags flags,
                                GCancellable *cancellable,
                                GError **error)
 {
+    SubprocessOutput *output;
+    output = malloc(sizeof(SubprocessOutput));
+
     g_autoptr(GSubprocess) subprocess = NULL;
     GInputStream *input_stream;
 
@@ -57,7 +60,9 @@ gs_vanilla_meta_run_subprocess(const gchar *cmd,
     if (!g_subprocess_wait(subprocess, cancellable, error))
         return NULL;
 
-    input_stream = g_subprocess_get_stdout_pipe(subprocess);
+    input_stream         = g_subprocess_get_stdout_pipe(subprocess);
+    output->input_stream = g_steal_pointer(&input_stream);
+    output->exit_code    = g_subprocess_get_exit_status(subprocess);
 
-    return g_steal_pointer(&input_stream);
+    return output;
 }
