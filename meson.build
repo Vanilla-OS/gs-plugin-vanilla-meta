@@ -8,8 +8,17 @@ files = [
 deps = [
   dependency('glib-2.0', version : '>= 2.70.0'),
   dependency('gnome-software'),
-  dependency('xmlb', version: '>= 0.1.7', fallback: ['libxmlb', 'libxmlb_dep'])
+  dependency('xmlb', version: '>= 0.1.7', fallback: ['libxmlb', 'libxmlb_dep']),
+  dependency('polkit-gobject-1')
 ]
+
+conf = configuration_data()
+conf.set_quoted('GETTEXT_PACKAGE', 'gnome-software')
+conf.set('HAVE_POLKIT', 1)
+configure_file(
+  output : 'config.h',
+  configuration : conf
+)
 
 args = [
   '-fPIC',
