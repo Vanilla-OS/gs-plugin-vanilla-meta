@@ -11,6 +11,7 @@
 #include "gs-plugin-vanilla-meta.h"
 #include "gs-vanilla-meta-util.h"
 
+static gint get_priority_for_interactivity(gboolean interactive);
 static gboolean plugin_vanillameta_pick_apx_desktop_file_cb(GsPlugin *plugin,
                                                             GsApp *app,
                                                             const gchar *filename,
@@ -23,6 +24,10 @@ static void enable_repository_thread_cb(GTask *task,
                                         gpointer task_data,
                                         GCancellable *cancellable);
 gboolean check_app_is_installed(GsApp *app, GCancellable *cancellable, GError *error);
+static void list_apps_thread_cb(GTask *task,
+                                gpointer source_object,
+                                gpointer task_data,
+                                GCancellable *cancellable);
 static void refine_thread_cb(GTask *task,
                              gpointer source_object,
                              gpointer task_data,
@@ -53,6 +58,12 @@ static void
 gs_plugin_vanilla_meta_finalize(GObject *object)
 {
     G_OBJECT_CLASS(gs_plugin_vanilla_meta_parent_class)->finalize(object);
+}
+
+static gint
+get_priority_for_interactivity(gboolean interactive)
+{
+    return interactive ? G_PRIORITY_DEFAULT : G_PRIORITY_LOW;
 }
 
 static void
@@ -138,7 +149,10 @@ gs_plugin_vanilla_meta_init(GsPluginVanillaMeta *self)
 gboolean
 gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellable, GError **error)
 {
-    g_autoptr(GsApp) app = NULL;
+    GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(plugin);
+    g_autoptr(GsApp) app      = NULL;
+
+    g_debug("Adding sources");
 
     // Create source
     /* app = gs_app_new("org.vanillaos.vanilla-meta"); */
@@ -150,6 +164,7 @@ gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellab
     gs_app_set_management_plugin(app, plugin);
     gs_vanilla_meta_app_set_packaging_info(app);
     gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
+    gs_app_set_branch(app, "main");
 
     gs_app_set_metadata(app, "GnomeSoftware::SortKey", "200");
     gs_app_set_metadata(app, "GnomeSoftware::InstallationKind", "User Installation");
@@ -170,7 +185,29 @@ gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellab
 
     gs_app_list_add(list, app);
 
-    // TODO: Add related apps (the ones installed from our repo)
+    // Add related apps (the ones installed from our repo)
+    if (self->silo != NULL) {
+        g_autofree gchar *xpath         = NULL;
+        g_autoptr(XbQuery) query        = NULL;
+        g_autoptr(GPtrArray) components = NULL;
+        g_autoptr(GError) local_error   = NULL;
+
+        xpath = g_strdup_printf("components[@origin='vanilla_meta']/component");
+        query = xb_query_new(self->silo, xpath, &local_error);
+
+        components = xb_silo_query_full(self->silo, query, &local_error);
+
+        for (int i = 0; i < components->len; i++) {
+            g_autoptr(GsApp) related =
+                gs_appstream_create_app(plugin, self->silo, components->pdata[i], &local_error);
+
+            g_debug("Created app %s", gs_app_get_name(related));
+            if (check_app_is_installed(related, cancellable, local_error))
+                gs_app_add_related(app, related);
+        }
+    } else {
+        g_debug("Silo is not initialized");
+    }
 
     return TRUE;
 }
@@ -438,6 +475,8 @@ gs_plugin_adopt_app(GsPlugin *plugin, GsApp *app)
     if (gs_app_get_metadata_item(app, "Vanilla::apx_container") != NULL) {
         g_debug("I should adopt app %s", gs_app_get_name(app));
         gs_app_set_management_plugin(app, plugin);
+        gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
+        gs_app_add_quirk(app, GS_APP_QUIRK_PROVENANCE);
         gs_vanilla_meta_app_set_packaging_info(app);
 
         /* gs_app_set_origin(app, "vanilla_meta"); */
@@ -455,14 +494,11 @@ check_app_is_installed(GsApp *app, GCancellable *cancellable, GError *error)
     package_name   = gs_app_get_source_default(app);
     if (package_name == NULL) {
         g_debug("Check installed: Package name for %s is null, can't verify", gs_app_get_name(app));
-        gs_app_set_state(app, GS_APP_STATE_UNKNOWN); // We have no idea if remove actually ran
+        gs_app_set_state(app, GS_APP_STATE_UNKNOWN);
         return FALSE;
     }
 
-    // const gchar *check_cmd = g_strdup_printf("apx %s show -i %s", container_flag,
-    // package_name);
-    const gchar *check_cmd = g_strdup_printf("/home/matbme/Documents/apx/apx %s show -i %s",
-                                             container_flag, package_name);
+    const gchar *check_cmd = g_strdup_printf("apx %s show -i %s", container_flag, package_name);
 
     SubprocessOutput *output = gs_vanilla_meta_run_subprocess(
         check_cmd, G_SUBPROCESS_FLAGS_STDOUT_SILENCE, cancellable, &error);
@@ -477,6 +513,91 @@ check_app_is_installed(GsApp *app, GCancellable *cancellable, GError *error)
 
     free(output);
     return TRUE;
+}
+
+static void
+gs_plugin_vanilla_meta_list_apps_async(GsPlugin *plugin,
+                                       GsAppQuery *query,
+                                       GsPluginListAppsFlags flags,
+                                       GCancellable *cancellable,
+                                       GAsyncReadyCallback callback,
+                                       gpointer user_data)
+{
+    GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(plugin);
+    g_autoptr(GTask) task     = NULL;
+    gboolean interactive      = (flags & GS_PLUGIN_LIST_APPS_FLAGS_INTERACTIVE);
+
+    task =
+        gs_plugin_list_apps_data_new_task(plugin, query, flags, cancellable, callback, user_data);
+    g_task_set_source_tag(task, gs_plugin_vanilla_meta_list_apps_async);
+
+    /* Queue a job to get the apps. */
+    gs_worker_thread_queue(self->worker, get_priority_for_interactivity(interactive),
+                           list_apps_thread_cb, g_steal_pointer(&task));
+}
+
+static void
+list_apps_thread_cb(GTask *task,
+                    gpointer source_object,
+                    gpointer task_data,
+                    GCancellable *cancellable)
+{
+    GsPluginVanillaMeta *self       = GS_PLUGIN_VANILLA_META(source_object);
+    g_autoptr(GsAppList) list       = gs_app_list_new();
+    GsPluginListAppsData *data      = task_data;
+    GsAppQueryTristate is_installed = GS_APP_QUERY_TRISTATE_UNSET;
+    g_autofree gchar *xpath         = NULL;
+    g_autoptr(XbQuery) query        = NULL;
+    g_autoptr(GPtrArray) components = NULL;
+    g_autoptr(GError) local_error   = NULL;
+
+    if (data->query != NULL) {
+        is_installed = gs_app_query_get_is_installed(data->query);
+    }
+
+    /* Currently only support a subset of query properties, and only one set at once. */
+    if (is_installed == GS_APP_QUERY_TRISTATE_FALSE ||
+        gs_app_query_get_n_properties_set(data->query) != 1) {
+        g_debug("Unsupported query");
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Unsupported query");
+        return;
+    }
+
+    if (is_installed == GS_APP_QUERY_TRISTATE_TRUE) {
+        xpath      = g_strdup_printf("components[@origin='vanilla_meta']/component");
+        query      = xb_query_new(self->silo, xpath, &local_error);
+        components = xb_silo_query_full(self->silo, query, &local_error);
+
+        for (int i = 0; i < components->len; i++) {
+            g_autoptr(GsApp) app = gs_appstream_create_app(source_object, self->silo,
+                                                           components->pdata[i], &local_error);
+            gs_app_set_metadata(app, "GnomeSoftware::Creator", gs_plugin_get_name(GS_PLUGIN(self)));
+            gs_app_set_management_plugin(app, GS_PLUGIN(self));
+            gs_app_set_branch(app, "main");
+            gs_app_add_quirk(app, GS_APP_QUIRK_PROVENANCE);
+
+            g_debug("%s bundle: %s", gs_app_get_name(app),
+                    gs_app_get_bundle_kind(app) == AS_BUNDLE_KIND_PACKAGE ? "Package" : "Other");
+            if (local_error != NULL) {
+                g_task_return_error(task, local_error);
+            }
+
+            if (check_app_is_installed(app, cancellable, local_error)) {
+                if (gs_app_get_state(app) == GS_APP_STATE_INSTALLED) {
+                    g_debug("%s is installed, adding", gs_app_get_id(app));
+                    gs_app_list_add(list, app);
+                }
+            }
+        }
+    }
+
+    g_task_return_pointer(task, g_steal_pointer(&list), g_object_unref);
+}
+
+static GsAppList *
+gs_plugin_vanilla_meta_list_apps_finish(GsPlugin *plugin, GAsyncResult *result, GError **error)
+{
+    return g_task_propagate_pointer(G_TASK(result), error);
 }
 
 static void
@@ -597,6 +718,8 @@ gs_plugin_vanilla_meta_class_init(GsPluginVanillaMetaClass *klass)
     plugin_class->enable_repository_finish  = gs_plugin_vanilla_meta_enable_repository_finish;
     plugin_class->disable_repository_async  = gs_plugin_vanilla_meta_disable_repository_async;
     plugin_class->disable_repository_finish = gs_plugin_vanilla_meta_disable_repository_finish;
+    plugin_class->list_apps_async           = gs_plugin_vanilla_meta_list_apps_async;
+    plugin_class->list_apps_finish          = gs_plugin_vanilla_meta_list_apps_finish;
     plugin_class->refine_async              = gs_plugin_vanilla_meta_refine_async;
     plugin_class->refine_finish             = gs_plugin_vanilla_meta_refine_finish;
 }
