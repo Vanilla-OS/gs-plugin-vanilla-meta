@@ -20,5 +20,6 @@ SubprocessOutput *gs_vanilla_meta_run_subprocess(const gchar *cmd,
                                                  GSubprocessFlags flags,
                                                  GCancellable *cancellable,
                                                  GError **error);
+const gchar *apx_container_name_to_alias(const gchar *container);
 
 G_END_DECLS

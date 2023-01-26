@@ -5,7 +5,6 @@
 /*
  * NOTES:
  * - Use `gs_utils_get_permission` to get PolicyKit permission
- * - Using plugin cache may solve the query issue
  */
 
 #include <bits/types/error_t.h>
@@ -600,7 +599,6 @@ list_apps_thread_cb(GTask *task,
 {
     GsPluginVanillaMeta *self       = GS_PLUGIN_VANILLA_META(source_object);
     g_autoptr(GsAppList) list       = gs_app_list_new();
-    g_autoptr(GsAppList) list_tmp   = gs_app_list_new();
     GsPluginListAppsData *data      = task_data;
     GsAppQueryTristate is_installed = GS_APP_QUERY_TRISTATE_UNSET;
     GsApp *alternate_of             = NULL;
@@ -621,52 +619,18 @@ list_apps_thread_cb(GTask *task,
         return;
     }
 
-    gs_plugin_cache_lookup_by_state(GS_PLUGIN(self), list_tmp, GS_APP_STATE_UNKNOWN);
+    if (is_installed == GS_APP_QUERY_TRISTATE_TRUE) {
+        GsAppList *installed_apps = gs_app_list_new();
 
-    GsAppList *tmptmplist = gs_app_list_new();
-
-    for (int i = 0; i < gs_app_list_length(list_tmp); i++) {
-        GsApp *app = gs_app_list_index(list_tmp, i);
-
-        if (is_installed == GS_APP_QUERY_TRISTATE_TRUE) {
-            if (check_app_is_installed(app, cancellable, local_error, FALSE)) {
-                if (gs_app_get_state(app) == GS_APP_STATE_INSTALLED) {
-                    g_debug("%s is installed, adding", gs_app_get_id(app));
-                    gs_app_list_add(tmptmplist, app);
-                }
-            }
-        }
-
-        if (alternate_of != NULL) {
-            gs_appstream_add_alternates(self->silo, alternate_of, tmptmplist, cancellable,
-                                        &local_error);
-            if (local_error != NULL) {
-                g_debug("Could not add alternates to %s", gs_app_get_name(app));
-                g_task_return_error(task, local_error);
-                return;
-            }
-
-            for (int j = 0; j < gs_app_list_length(tmptmplist); j++) {
-                GsApp *alternate_app = gs_app_list_index(tmptmplist, j);
-
-                if (gs_app_get_origin(alternate_app) == NULL) {
-                    gs_app_set_origin(alternate_app, "vanilla_meta");
-                    gs_app_set_origin_ui(alternate_app, "VanillaOS Meta");
-                    gs_app_set_origin_hostname(alternate_app, "https://vanillaos.org");
-                }
-            }
-
-            if (local_error != NULL) {
-                g_debug("Failed to set alternate of %s", gs_app_get_name(alternate_of));
-                g_task_return_error(task, local_error);
-                return;
-            }
-        }
+        gs_plugin_cache_lookup_by_state(GS_PLUGIN(self), installed_apps, GS_APP_STATE_INSTALLED);
+        gs_app_list_add_list(list, installed_apps);
     }
 
-    for (int i = 0; i < gs_app_list_length(tmptmplist); i++) {
-        GsApp *app = gs_app_list_index(tmptmplist, i);
-        gs_app_list_add(list, gs_plugin_cache_lookup(GS_PLUGIN(self), gs_app_get_id(app)));
+    if (alternate_of != NULL) {
+        GsApp *app = gs_plugin_cache_lookup(GS_PLUGIN(self), gs_app_get_id(alternate_of));
+
+        if (app != NULL)
+            gs_app_list_add(list, app);
     }
 
     g_task_return_pointer(task, g_steal_pointer(&list), g_object_unref);
@@ -767,15 +731,9 @@ refine_app(GsPluginVanillaMeta *self,
         gs_app_set_size_installed(app, GS_SIZE_TYPE_VALID, 0);
     }
 
-    gs_app_set_rating(app, 5);
-
-    AsReview *review = as_review_new();
-    as_review_set_rating(review, 100);
-    as_review_set_description(review, "I am a review");
-    as_review_set_id(review, "review.id");
-    as_review_set_reviewer_name(review, "Mateus");
-    as_review_set_summary(review, "Hello");
-    gs_app_add_review(app, g_steal_pointer(&review));
+    gs_app_set_origin(app, "vanilla_meta");
+    gs_app_set_origin_ui(app, "VanillaOS Meta");
+    gs_app_set_origin_hostname(app, "https://vanillaos.org");
 
     if (component == NULL) {
         g_debug("no match for %s: %s", xpath, error_local->message);
@@ -801,6 +759,9 @@ refine_app(GsPluginVanillaMeta *self,
 
     gs_app_set_metadata(app, "Vanilla::container", container_name);
     g_debug("Adding container %s to app %s", container_name, gs_app_get_name(app));
+
+    gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat",
+                        apx_container_name_to_alias(container_name));
 
     gs_vanilla_meta_app_set_packaging_info(app);
 

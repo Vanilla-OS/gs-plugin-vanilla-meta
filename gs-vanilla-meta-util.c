@@ -9,7 +9,7 @@ gs_vanilla_meta_app_set_packaging_info(GsApp *app)
 {
     g_return_if_fail(GS_IS_APP(app));
 
-    gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat", "Apx");
+    /* gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat", "Apx"); */
     gs_app_set_metadata(app, "GnomeSoftware::SortKey", "200");
     gs_app_set_metadata(app, "GnomeSoftware::PackagingBaseCssColor", "warning_color");
     gs_app_set_metadata(app, "GnomeSoftware::PackagingIcon", "org.vanillaos.FirstSetup-symbolic");
@@ -64,4 +64,27 @@ gs_vanilla_meta_run_subprocess(const gchar *cmd,
     output->exit_code    = g_subprocess_get_exit_status(subprocess);
 
     return output;
+}
+
+/*
+ * Gets the "pretty" name from container name (e.g. "apx_managed_aur" returns "AUR")
+ */
+const gchar *
+apx_container_name_to_alias(const gchar *container)
+{
+    if (!g_strcmp0(container, "apx_managed")) {
+        return "APT";
+    } else if (!g_strcmp0(container, "apx_managed_aur")) {
+        return "AUR";
+    } else if (!g_strcmp0(container, "apx_managed_dnf")) {
+        return "DNF";
+    } else if (!g_strcmp0(container, "apx_managed_apk")) {
+        return "APK";
+    } else if (!g_strcmp0(container, "apx_managed_zypper")) {
+        return "ZYPPER";
+    } else if (!g_strcmp0(container, "apx_managed_xbps")) {
+        return "XBPS";
+    } else {
+        return "";
+    }
 }
