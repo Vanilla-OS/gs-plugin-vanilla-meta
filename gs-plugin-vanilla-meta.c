@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <xmlb.h>
 
+#include "gs-app.h"
 #include "gs-plugin-vanilla-meta.h"
 #include "gs-vanilla-meta-util.h"
 
@@ -23,7 +24,13 @@ static gboolean plugin_vanillameta_pick_apx_desktop_file_cb(GsPlugin *plugin,
                                                             GsApp *app,
                                                             const gchar *filename,
                                                             GKeyFile *key_file);
-
+static gboolean
+refresh_plugin_cache(GsPluginVanillaMeta *self, GCancellable *cancellable, GError **error);
+static gboolean refine_app(GsPluginVanillaMeta *self,
+                           GsApp *app,
+                           GsPluginRefineFlags flags,
+                           GCancellable *cancellable,
+                           GError **error);
 static void
 setup_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable);
 static void enable_repository_thread_cb(GTask *task,
@@ -144,6 +151,45 @@ setup_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCancel
     }
 
     g_task_return_boolean(task, TRUE);
+}
+
+static gboolean
+refresh_plugin_cache(GsPluginVanillaMeta *self, GCancellable *cancellable, GError **error)
+{
+    g_autofree gchar *xpath         = NULL;
+    g_autoptr(GPtrArray) components = NULL;
+    g_autoptr(GError) local_error   = NULL;
+    GsPluginRefineFlags refine_flags;
+
+    xpath      = g_strdup_printf("components[@origin='vanilla_meta']/component/id");
+    components = xb_silo_query(self->silo, xpath, 0, &local_error);
+
+    if (local_error != NULL) {
+        g_debug("Plugin cache query returned error: %s", local_error->message);
+        return FALSE;
+    }
+
+    for (int i = 0; i < components->len; i++) {
+        XbNode *node = components->pdata[i];
+        g_debug("Ensure: %s", xb_node_get_text(node));
+
+        g_autoptr(GsApp) app = gs_plugin_cache_lookup(GS_PLUGIN(self), xb_node_get_text(node));
+        if (app == NULL) {
+            app = gs_app_new(xb_node_get_text(node));
+            gs_app_set_management_plugin(app, GS_PLUGIN(self));
+
+            gs_plugin_cache_add(GS_PLUGIN(self), xb_node_get_text(node), app);
+
+            refine_flags = GS_PLUGIN_REFINE_FLAGS_REQUIRE_ICON |
+                           GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE | GS_PLUGIN_REFINE_FLAGS_REQUIRE_ID;
+            if (!refine_app(self, app, refine_flags, cancellable, &local_error)) {
+                g_debug("I'm stupid and could not refine app");
+                return FALSE;
+            }
+        }
+    }
+
+    return TRUE;
 }
 
 static gboolean
@@ -439,21 +485,6 @@ gs_plugin_app_install(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, G
 }
 
 gboolean
-gs_plugin_update_app(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GError **error)
-{
-    return TRUE;
-}
-
-gboolean
-gs_plugin_app_upgrade_trigger(GsPlugin *plugin,
-                              GsApp *app,
-                              GCancellable *cancellable,
-                              GError **error)
-{
-    return TRUE;
-}
-
-gboolean
 gs_plugin_app_remove(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GError **error)
 {
     const gchar *package_name       = NULL;
@@ -498,7 +529,9 @@ gs_plugin_adopt_app(GsPlugin *plugin, GsApp *app)
         gs_app_add_quirk(app, GS_APP_QUIRK_PROVENANCE);
         gs_vanilla_meta_app_set_packaging_info(app);
 
-        /* gs_app_set_origin(app, "vanilla_meta"); */
+        if (gs_plugin_cache_lookup(plugin, gs_app_get_id(app)) == NULL) {
+            gs_plugin_cache_add(plugin, gs_app_get_id(app), app);
+        }
     }
 }
 
@@ -571,9 +604,9 @@ list_apps_thread_cb(GTask *task,
     GsPluginListAppsData *data      = task_data;
     GsAppQueryTristate is_installed = GS_APP_QUERY_TRISTATE_UNSET;
     GsApp *alternate_of             = NULL;
-    g_autofree gchar *xpath         = NULL;
-    g_autoptr(GPtrArray) components = NULL;
     g_autoptr(GError) local_error   = NULL;
+
+    refresh_plugin_cache(self, cancellable, &local_error);
 
     if (data->query != NULL) {
         is_installed = gs_app_query_get_is_installed(data->query);
@@ -588,33 +621,9 @@ list_apps_thread_cb(GTask *task,
         return;
     }
 
-    xpath      = g_strdup_printf("components[@origin='vanilla_meta']/component");
-    components = xb_silo_query(self->silo, xpath, 0, &local_error);
+    gs_plugin_cache_lookup_by_state(GS_PLUGIN(self), list_tmp, GS_APP_STATE_UNKNOWN);
 
-    if (local_error != NULL) {
-        g_debug("List installed query returned error");
-        g_task_return_error(task, local_error);
-        return;
-    }
-
-    for (int i = 0; i < components->len; i++) {
-        g_autoptr(GsApp) app =
-            gs_appstream_create_app(source_object, self->silo, components->pdata[i], &local_error);
-        gs_app_set_management_plugin(app, GS_PLUGIN(self));
-        gs_app_list_add(list_tmp, app);
-
-        gs_app_set_origin(app, "vanilla_meta");
-        gs_app_set_origin_appstream(app, "org.gnome.Software.Plugin.VanillaMeta");
-        gs_app_set_origin_ui(app, "VanillaOS Meta");
-        gs_app_set_origin_hostname(app, "https://vanillaos.org");
-
-        gs_vanilla_meta_app_set_packaging_info(app);
-
-        if (local_error != NULL) {
-            g_task_return_error(task, local_error);
-            return;
-        }
-    }
+    GsAppList *tmptmplist = gs_app_list_new();
 
     for (int i = 0; i < gs_app_list_length(list_tmp); i++) {
         GsApp *app = gs_app_list_index(list_tmp, i);
@@ -623,24 +632,28 @@ list_apps_thread_cb(GTask *task,
             if (check_app_is_installed(app, cancellable, local_error, FALSE)) {
                 if (gs_app_get_state(app) == GS_APP_STATE_INSTALLED) {
                     g_debug("%s is installed, adding", gs_app_get_id(app));
-                    gs_app_list_add(list, app);
+                    gs_app_list_add(tmptmplist, app);
                 }
             }
         }
 
         if (alternate_of != NULL) {
-            gs_appstream_add_alternates(self->silo, alternate_of, list, cancellable, &local_error);
+            gs_appstream_add_alternates(self->silo, alternate_of, tmptmplist, cancellable,
+                                        &local_error);
             if (local_error != NULL) {
                 g_debug("Could not add alternates to %s", gs_app_get_name(app));
                 g_task_return_error(task, local_error);
                 return;
             }
 
-            for (int j = 0; j < gs_app_list_length(list); j++) {
-                GsApp *alternate_app = gs_app_list_index(list, j);
+            for (int j = 0; j < gs_app_list_length(tmptmplist); j++) {
+                GsApp *alternate_app = gs_app_list_index(tmptmplist, j);
 
-                if (gs_app_get_origin(alternate_app) == NULL)
+                if (gs_app_get_origin(alternate_app) == NULL) {
                     gs_app_set_origin(alternate_app, "vanilla_meta");
+                    gs_app_set_origin_ui(alternate_app, "VanillaOS Meta");
+                    gs_app_set_origin_hostname(alternate_app, "https://vanillaos.org");
+                }
             }
 
             if (local_error != NULL) {
@@ -649,6 +662,11 @@ list_apps_thread_cb(GTask *task,
                 return;
             }
         }
+    }
+
+    for (int i = 0; i < gs_app_list_length(tmptmplist); i++) {
+        GsApp *app = gs_app_list_index(tmptmplist, i);
+        gs_app_list_add(list, gs_plugin_cache_lookup(GS_PLUGIN(self), gs_app_get_id(app)));
     }
 
     g_task_return_pointer(task, g_steal_pointer(&list), g_object_unref);
@@ -689,102 +707,105 @@ refine_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCance
     GsPluginRefineData *data      = task_data;
     g_autoptr(GError) local_error = NULL;
 
+    refresh_plugin_cache(self, cancellable, &local_error);
+
     for (guint i = 0; i < gs_app_list_length(data->list); i++) {
         GsApp *app               = gs_app_list_index(data->list, i);
         GsPluginRefineData *data = task_data;
 
-        const gchar *source           = gs_app_get_source_default(app);
-        g_autofree gchar *source_safe = NULL;
-        g_autofree gchar *xpath       = NULL;
-        g_autoptr(XbNode) component   = NULL;
-        g_autoptr(GError) error_local = NULL;
-        const gchar *container_name   = NULL;
-        XbNodeChildIter iter;
-        g_autoptr(XbNode) child = NULL;
-
         if (gs_app_get_metadata_item(app, "Vanilla::apx_container") == NULL)
             continue;
 
-        gs_app_set_origin(app, "vanilla_meta");
-        gs_app_set_origin_appstream(app, "org.gnome.Software.Plugin.VanillaMeta");
-        gs_app_set_origin_ui(app, "VanillaOS Meta");
-        gs_app_set_origin_hostname(app, "https://vanillaos.org");
-
-        gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
-
-        gs_vanilla_meta_app_set_packaging_info(app);
-
-        if (!gs_app_has_management_plugin(app, NULL))
-            gs_app_set_management_plugin(app, GS_PLUGIN(self));
-
-        if (gs_app_has_quirk(app, GS_APP_QUIRK_IS_WILDCARD)) {
-            g_debug("App %s is wildcard. Skipping..", gs_app_get_id(app));
-            continue;
+        if (!refine_app(self, app, data->flags, cancellable, &local_error)) {
+            g_task_return_error(task, local_error);
         }
-
-        check_app_is_installed(app, cancellable, local_error, TRUE);
-
-        /* find using source and origin */
-        source_safe = xb_string_escape(source);
-        xpath       = g_strdup_printf("components[@origin='vanilla_meta']/component/"
-                                            "bundle[@container][text()='%s']/..",
-                                      source_safe);
-
-        component = xb_silo_query_first(self->silo, xpath, &error_local);
-        if (error_local != NULL) {
-            g_debug("Failed to refine app %s in query stage", gs_app_get_name(app));
-            g_task_return_error(task, error_local);
-            return;
-        }
-
-        if (data->flags & GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE) {
-            gs_app_set_size_download(app, GS_SIZE_TYPE_VALID, 0);
-            gs_app_set_size_cache_data(app, GS_SIZE_TYPE_VALID, 0);
-            gs_app_set_size_user_data(app, GS_SIZE_TYPE_VALID, 0);
-            gs_app_set_size_installed(app, GS_SIZE_TYPE_VALID, 0);
-        }
-
-        gs_app_set_rating(app, 5);
-
-        AsReview *review = as_review_new();
-        as_review_set_rating(review, 100);
-        as_review_set_description(review, "I am a review");
-        as_review_set_id(review, "review.id");
-        as_review_set_reviewer_name(review, "Mateus");
-        as_review_set_summary(review, "Hello");
-        gs_app_add_review(app, g_steal_pointer(&review));
-
-        if (component == NULL) {
-            g_debug("no match for %s: %s", xpath, error_local->message);
-            g_clear_error(&error_local);
-
-            g_task_return_boolean(task, TRUE);
-            return;
-        }
-
-        gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, data->flags,
-                                &error_local);
-        if (error_local != NULL) {
-            g_debug("Failed to refine app %s", gs_app_get_name(app));
-            g_task_return_error(task, error_local);
-            return;
-        }
-
-        // Iterate node's children until we find container name
-        xb_node_child_iter_init(&iter, component);
-        while (xb_node_child_iter_next(&iter, &child)) {
-            container_name = xb_node_get_attr(child, "container");
-            if (container_name != NULL)
-                break;
-        }
-
-        gs_app_set_metadata(app, "Vanilla::container", container_name);
-        g_debug("Adding container %s to app %s", container_name, gs_app_get_name(app));
-
-        g_debug("Refined %s", gs_app_get_id(app));
     }
 
     g_task_return_boolean(task, TRUE);
+}
+
+static gboolean
+refine_app(GsPluginVanillaMeta *self,
+           GsApp *app,
+           GsPluginRefineFlags flags,
+           GCancellable *cancellable,
+           GError **error)
+{
+    g_autofree gchar *id_safe     = NULL;
+    g_autofree gchar *xpath       = NULL;
+    g_autoptr(XbNode) component   = NULL;
+    g_autoptr(GError) error_local = NULL;
+    const gchar *container_name   = NULL;
+    XbNodeChildIter iter;
+    g_autoptr(XbNode) child       = NULL;
+    g_autoptr(GError) local_error = NULL;
+
+    if (!gs_app_has_management_plugin(app, NULL))
+        gs_app_set_management_plugin(app, GS_PLUGIN(self));
+
+    if (gs_app_has_quirk(app, GS_APP_QUIRK_IS_WILDCARD)) {
+        g_debug("App %s is wildcard. Skipping..", gs_app_get_id(app));
+        return FALSE;
+    }
+
+    /* find using source and origin */
+    id_safe = xb_string_escape(gs_app_get_id(app));
+    xpath   = g_strdup_printf("components[@origin='vanilla_meta']/component/"
+                                "id[text()='%s']/..",
+                              id_safe);
+
+    component = xb_silo_query_first(self->silo, xpath, &error_local);
+    if (error_local != NULL) {
+        g_debug("Failed to refine app %s in query stage", gs_app_get_name(app));
+        return FALSE;
+    }
+
+    if (flags & GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE) {
+        gs_app_set_size_download(app, GS_SIZE_TYPE_VALID, 0);
+        gs_app_set_size_cache_data(app, GS_SIZE_TYPE_VALID, 0);
+        gs_app_set_size_user_data(app, GS_SIZE_TYPE_VALID, 0);
+        gs_app_set_size_installed(app, GS_SIZE_TYPE_VALID, 0);
+    }
+
+    gs_app_set_rating(app, 5);
+
+    AsReview *review = as_review_new();
+    as_review_set_rating(review, 100);
+    as_review_set_description(review, "I am a review");
+    as_review_set_id(review, "review.id");
+    as_review_set_reviewer_name(review, "Mateus");
+    as_review_set_summary(review, "Hello");
+    gs_app_add_review(app, g_steal_pointer(&review));
+
+    if (component == NULL) {
+        g_debug("no match for %s: %s", xpath, error_local->message);
+        g_clear_error(&error_local);
+        return FALSE;
+    }
+
+    gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, flags, &error_local);
+    if (error_local != NULL) {
+        g_debug("Failed to refine app %s", gs_app_get_name(app));
+        return FALSE;
+    }
+
+    check_app_is_installed(app, cancellable, local_error, TRUE);
+
+    // Iterate node's children until we find container name
+    xb_node_child_iter_init(&iter, component);
+    while (xb_node_child_iter_next(&iter, &child)) {
+        container_name = xb_node_get_attr(child, "container");
+        if (container_name != NULL)
+            break;
+    }
+
+    gs_app_set_metadata(app, "Vanilla::container", container_name);
+    g_debug("Adding container %s to app %s", container_name, gs_app_get_name(app));
+
+    gs_vanilla_meta_app_set_packaging_info(app);
+
+    g_debug("Refined %s", gs_app_get_id(app));
+    return TRUE;
 }
 
 static gboolean
