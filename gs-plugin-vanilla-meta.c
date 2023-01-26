@@ -2,19 +2,12 @@
  * Copyright (C) 2023 Mateus Melchiades
  */
 
-/*
- * NOTES:
- * - Use `gs_utils_get_permission` to get PolicyKit permission
- */
-
-#include <bits/types/error_t.h>
 #include <glib.h>
 #include <gnome-software.h>
 #include <gnome-software/gs-appstream.h>
 #include <stdlib.h>
 #include <xmlb.h>
 
-#include "gs-app.h"
 #include "gs-plugin-vanilla-meta.h"
 #include "gs-vanilla-meta-util.h"
 
@@ -49,17 +42,19 @@ static void refine_thread_cb(GTask *task,
                              gpointer task_data,
                              GCancellable *cancellable);
 
-const gchar *gz_metadata_filename   = "/usr/share/swcatalog/xml/vanillaos-kinetic-main.xml";
+const gchar *gz_metadata_filename   = "/usr/share/swcatalog/xml/vanillaos-kinetic-main.xml.gz";
 const gchar *metadata_silo_filename = ".cache/vanilla_meta/metadata.xmlb";
 
 struct _GsPluginVanillaMeta {
     GsPlugin parent;
     GsWorkerThread *worker; /* (owned) */
-    // TODO: Create mutex lock for silo
+    GMutex silo_mutex;
     XbSilo *silo;
 };
 
 G_DEFINE_TYPE(GsPluginVanillaMeta, gs_plugin_vanilla_meta, GS_TYPE_PLUGIN)
+
+#define assert_in_worker(self) g_assert(gs_worker_thread_is_in_worker_context(self->worker))
 
 static void
 gs_plugin_vanilla_meta_dispose(GObject *object)
@@ -67,6 +62,7 @@ gs_plugin_vanilla_meta_dispose(GObject *object)
     GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(object);
 
     g_clear_object(&self->worker);
+    g_mutex_clear(&self->silo_mutex);
     G_OBJECT_CLASS(gs_plugin_vanilla_meta_parent_class)->dispose(object);
 }
 
@@ -91,6 +87,8 @@ gs_plugin_vanilla_meta_setup_async(GsPlugin *plugin,
     GsPluginVanillaMeta *self = GS_PLUGIN_VANILLA_META(plugin);
     g_autoptr(GTask) task     = NULL;
 
+    g_mutex_init(&self->silo_mutex);
+
     task = g_task_new(plugin, cancellable, callback, user_data);
     g_task_set_source_tag(task, gs_plugin_vanilla_meta_setup_async);
 
@@ -112,6 +110,8 @@ setup_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCancel
     g_autoptr(GFile) silo_file        = g_file_new_for_path(metadata_silo_filename);
     g_autoptr(GFile) metadata_file    = g_file_new_for_path(gz_metadata_filename);
     g_autoptr(GError) error           = NULL;
+
+    assert_in_worker(self);
 
     g_debug("Loading app silo");
 
@@ -138,11 +138,13 @@ setup_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCancel
     xb_builder_import_source(builder, source);
 
     // Save to silo
+    g_mutex_lock(&self->silo_mutex);
     self->silo = xb_builder_ensure(builder, silo_file,
                                    XB_BUILDER_COMPILE_FLAG_IGNORE_INVALID |
                                        XB_BUILDER_COMPILE_FLAG_SINGLE_LANG,
                                    cancellable, &error);
 
+    g_mutex_unlock(&self->silo_mutex);
     if (self->silo == NULL) {
         g_debug("Failed to create silo: %s", error->message);
         g_task_return_error(task, g_steal_pointer(&error));
@@ -160,8 +162,10 @@ refresh_plugin_cache(GsPluginVanillaMeta *self, GCancellable *cancellable, GErro
     g_autoptr(GError) local_error   = NULL;
     GsPluginRefineFlags refine_flags;
 
+    g_mutex_lock(&self->silo_mutex);
     xpath      = g_strdup_printf("components[@origin='vanilla_meta']/component/id");
     components = xb_silo_query(self->silo, xpath, 0, &local_error);
+    g_mutex_unlock(&self->silo_mutex);
 
     if (local_error != NULL) {
         g_debug("Plugin cache query returned error: %s", local_error->message);
@@ -176,13 +180,14 @@ refresh_plugin_cache(GsPluginVanillaMeta *self, GCancellable *cancellable, GErro
         if (app == NULL) {
             app = gs_app_new(xb_node_get_text(node));
             gs_app_set_management_plugin(app, GS_PLUGIN(self));
+            gs_app_set_origin(app, "vanilla_meta");
 
             gs_plugin_cache_add(GS_PLUGIN(self), xb_node_get_text(node), app);
 
             refine_flags = GS_PLUGIN_REFINE_FLAGS_REQUIRE_ICON |
                            GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE | GS_PLUGIN_REFINE_FLAGS_REQUIRE_ID;
             if (!refine_app(self, app, refine_flags, cancellable, &local_error)) {
-                g_debug("I'm stupid and could not refine app");
+                g_debug("Could not refine app %s", gs_app_get_id(app));
                 return FALSE;
             }
         }
@@ -248,6 +253,7 @@ gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellab
     gs_app_list_add(list, app);
 
     // Add related apps (the ones installed from our repo)
+    g_mutex_lock(&self->silo_mutex);
     if (self->silo != NULL) {
         g_autofree gchar *xpath         = NULL;
         g_autoptr(GPtrArray) components = NULL;
@@ -257,6 +263,7 @@ gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellab
         components = xb_silo_query(self->silo, xpath, 0, &local_error);
         if (local_error != NULL) {
             g_debug("Failed to add sources");
+            g_mutex_unlock(&self->silo_mutex);
             return FALSE;
         }
 
@@ -271,6 +278,7 @@ gs_plugin_add_sources(GsPlugin *plugin, GsAppList *list, GCancellable *cancellab
     } else {
         g_debug("Silo is not initialized");
     }
+    g_mutex_unlock(&self->silo_mutex);
 
     return TRUE;
 }
@@ -312,6 +320,8 @@ enable_repository_thread_cb(GTask *task,
 {
     GsPluginVanillaMeta *self          = GS_PLUGIN_VANILLA_META(source_object);
     GsPluginManageRepositoryData *data = task_data;
+
+    assert_in_worker(self);
 
     gs_app_set_state(data->repository, GS_APP_STATE_INSTALLED);
     gs_plugin_repository_changed(GS_PLUGIN(self), data->repository);
@@ -521,7 +531,7 @@ gs_plugin_app_remove(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GE
 void
 gs_plugin_adopt_app(GsPlugin *plugin, GsApp *app)
 {
-    if (gs_app_get_metadata_item(app, "Vanilla::apx_container") != NULL) {
+    if (g_strcmp0(gs_app_get_origin(app), "vanilla_meta")) {
         g_debug("I should adopt app %s", gs_app_get_name(app));
         gs_app_set_management_plugin(app, plugin);
         gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
@@ -604,6 +614,8 @@ list_apps_thread_cb(GTask *task,
     GsApp *alternate_of             = NULL;
     g_autoptr(GError) local_error   = NULL;
 
+    assert_in_worker(self);
+
     refresh_plugin_cache(self, cancellable, &local_error);
 
     if (data->query != NULL) {
@@ -671,17 +683,19 @@ refine_thread_cb(GTask *task, gpointer source_object, gpointer task_data, GCance
     GsPluginRefineData *data      = task_data;
     g_autoptr(GError) local_error = NULL;
 
+    assert_in_worker(self);
+
     refresh_plugin_cache(self, cancellable, &local_error);
 
     for (guint i = 0; i < gs_app_list_length(data->list); i++) {
         GsApp *app               = gs_app_list_index(data->list, i);
         GsPluginRefineData *data = task_data;
 
-        if (gs_app_get_metadata_item(app, "Vanilla::apx_container") == NULL)
+        if (g_strcmp0(gs_app_get_origin(app), "vanilla_meta"))
             continue;
 
         if (!refine_app(self, app, data->flags, cancellable, &local_error)) {
-            g_task_return_error(task, local_error);
+            g_task_return_error(task, g_steal_pointer(&local_error));
         }
     }
 
@@ -718,6 +732,7 @@ refine_app(GsPluginVanillaMeta *self,
                                 "id[text()='%s']/..",
                               id_safe);
 
+    g_mutex_lock(&self->silo_mutex);
     component = xb_silo_query_first(self->silo, xpath, &error_local);
     if (error_local != NULL) {
         g_debug("Failed to refine app %s in query stage", gs_app_get_name(app));
@@ -746,6 +761,7 @@ refine_app(GsPluginVanillaMeta *self,
         g_debug("Failed to refine app %s", gs_app_get_name(app));
         return FALSE;
     }
+    g_mutex_unlock(&self->silo_mutex);
 
     check_app_is_installed(app, cancellable, local_error, TRUE);
 
