@@ -1,0 +1,22 @@
+Source: libgs-plugin-vanilla-meta
+Section: devel
+Priority: extra
+Maintainer: Mateus Melchiades <mateusbmelchiades@gmail.com>
+Uploaders: Mateus Melchiades <mateusbmelchiades@gmail.com>
+Build-Depends: mason,
+               gnome-software-dev,
+               libglib2.0-dev,
+               libxmlb-dev
+Standards-Version: 3.9.6
+Homepage: https://github.com/Vanilla-OS/gs-plugin-vanilla-meta
+Vcs-Browser: https://github.com/Vanilla-OS/gs-plugin-vanilla-meta
+Vcs-Git: git://github.com/Vanilla-OS/gs-plugin-vanilla-meta.git
+
+Package: libgs-plugin-vanilla-meta
+Architecture: all
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         gnome-software,
+         apx
+Built-Using: ${misc:Built-Using}
+Description: Gnome Software plugin for managing apx packages
