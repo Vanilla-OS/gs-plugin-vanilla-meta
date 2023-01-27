@@ -712,7 +712,6 @@ refine_app(GsPluginVanillaMeta *self,
     g_autofree gchar *id_safe     = NULL;
     g_autofree gchar *xpath       = NULL;
     g_autoptr(XbNode) component   = NULL;
-    g_autoptr(GError) error_local = NULL;
     const gchar *container_name   = NULL;
     XbNodeChildIter iter;
     g_autoptr(XbNode) child       = NULL;
@@ -733,31 +732,34 @@ refine_app(GsPluginVanillaMeta *self,
                               id_safe);
 
     g_mutex_lock(&self->silo_mutex);
-    component = xb_silo_query_first(self->silo, xpath, &error_local);
-    if (error_local != NULL) {
+    component = xb_silo_query_first(self->silo, xpath, &local_error);
+    if (local_error != NULL) {
         g_debug("Failed to refine app %s in query stage", gs_app_get_name(app));
         return FALSE;
     }
 
-    if (flags & GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE) {
-        gs_app_set_size_download(app, GS_SIZE_TYPE_VALID, 0);
-        gs_app_set_size_cache_data(app, GS_SIZE_TYPE_VALID, 0);
-        gs_app_set_size_user_data(app, GS_SIZE_TYPE_VALID, 0);
-        gs_app_set_size_installed(app, GS_SIZE_TYPE_VALID, 0);
-    }
+    // TODO: Find a way to query file sizes
+    /* if (flags & GS_PLUGIN_REFINE_FLAGS_REQUIRE_SIZE) { */
+    /*     gs_app_set_size_download(app, GS_SIZE_TYPE_VALID, 0); */
+    /*     gs_app_set_size_cache_data(app, GS_SIZE_TYPE_VALID, 0); */
+    /*     gs_app_set_size_user_data(app, GS_SIZE_TYPE_VALID, 0); */
+    /*     gs_app_set_size_installed(app, GS_SIZE_TYPE_VALID, 0); */
+    /* } */
+
+    gs_app_add_quirk(app, GS_APP_QUIRK_PROVENANCE);
 
     gs_app_set_origin(app, "vanilla_meta");
     gs_app_set_origin_ui(app, "VanillaOS Meta");
     gs_app_set_origin_hostname(app, "https://vanillaos.org");
 
     if (component == NULL) {
-        g_debug("no match for %s: %s", xpath, error_local->message);
-        g_clear_error(&error_local);
+        g_debug("no match for %s: %s", xpath, local_error->message);
+        g_clear_error(&local_error);
         return FALSE;
     }
 
-    gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, flags, &error_local);
-    if (error_local != NULL) {
+    gs_appstream_refine_app(GS_PLUGIN(self), app, self->silo, component, flags, &local_error);
+    if (local_error != NULL) {
         g_debug("Failed to refine app %s", gs_app_get_name(app));
         return FALSE;
     }
