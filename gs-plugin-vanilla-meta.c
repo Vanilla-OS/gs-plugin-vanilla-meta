@@ -611,6 +611,7 @@ list_apps_thread_cb(GTask *task,
     g_autoptr(GsAppList) list       = gs_app_list_new();
     GsPluginListAppsData *data      = task_data;
     GsAppQueryTristate is_installed = GS_APP_QUERY_TRISTATE_UNSET;
+    GsCategory *category            = NULL;
     GsApp *alternate_of             = NULL;
     g_autoptr(GError) local_error   = NULL;
 
@@ -619,6 +620,7 @@ list_apps_thread_cb(GTask *task,
     refresh_plugin_cache(self, cancellable, &local_error);
 
     if (data->query != NULL) {
+        category     = gs_app_query_get_category(data->query);
         is_installed = gs_app_query_get_is_installed(data->query);
         alternate_of = gs_app_query_get_alternate_of(data->query);
     }
@@ -636,6 +638,26 @@ list_apps_thread_cb(GTask *task,
 
         gs_plugin_cache_lookup_by_state(GS_PLUGIN(self), installed_apps, GS_APP_STATE_INSTALLED);
         gs_app_list_add_list(list, installed_apps);
+    }
+
+    if (category != NULL) {
+        g_autoptr(GsAppList) list_tmp = gs_app_list_new();
+
+        if (!gs_appstream_add_category_apps(GS_PLUGIN(self), self->silo, category, list_tmp,
+                                            cancellable, &local_error)) {
+            g_task_return_error(task, local_error);
+            return;
+        }
+
+        for (int i = 0; i < gs_app_list_length(list_tmp); i++) {
+            GsApp *app        = gs_app_list_index(list_tmp, i);
+            GsApp *cached_app = gs_plugin_cache_lookup(GS_PLUGIN(self), gs_app_get_id(app));
+
+            if (cached_app != NULL) {
+                g_debug("category: Adding app %s", gs_app_get_name(cached_app));
+                gs_app_list_add(list, cached_app);
+            }
+        }
     }
 
     if (alternate_of != NULL) {
