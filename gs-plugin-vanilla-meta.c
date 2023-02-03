@@ -531,7 +531,7 @@ gs_plugin_app_remove(GsPlugin *plugin, GsApp *app, GCancellable *cancellable, GE
 void
 gs_plugin_adopt_app(GsPlugin *plugin, GsApp *app)
 {
-    if (g_strcmp0(gs_app_get_origin(app), "vanilla_meta")) {
+    if (!g_strcmp0(gs_app_get_origin(app), "vanilla_meta")) {
         g_debug("I should adopt app %s", gs_app_get_name(app));
         gs_app_set_management_plugin(app, plugin);
         gs_app_set_scope(app, AS_COMPONENT_SCOPE_USER);
@@ -713,9 +713,9 @@ refine_app(GsPluginVanillaMeta *self,
     g_autofree gchar *xpath       = NULL;
     g_autoptr(XbNode) component   = NULL;
     const gchar *container_name   = NULL;
-    XbNodeChildIter iter;
     g_autoptr(XbNode) child       = NULL;
     g_autoptr(GError) local_error = NULL;
+    XbNodeChildIter iter;
 
     if (!gs_app_has_management_plugin(app, NULL))
         gs_app_set_management_plugin(app, GS_PLUGIN(self));
