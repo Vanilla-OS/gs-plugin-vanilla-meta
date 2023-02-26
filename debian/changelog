@@ -1,3 +1,9 @@
+libgs-plugin-vanilla-meta (0.1.0-1) lunar; urgency=medium
+
+  * First testing release
+
+ -- Mateus Melchiades <mateusbmelchiades@gmail.com>  Fri, 27 Jan 2023 19:26:03 -0300
+
 libgs-plugin-vanilla-meta (0.1.0) kinetic; urgency=medium
 
   * First testing release
